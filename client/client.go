@@ -142,14 +142,13 @@ func (cli *StreamClient) processLoop() {
 	}
 
 	readChan := make(chan []byte)
-	pongChan := make(chan struct{})
-	closeChan := make(chan struct{})
-	defer func() { close(closeChan) }()
-	defer func() { close(pongChan) }()
-	defer func() { close(readChan) }()
+	pongChan := make(chan struct{}, 1)
+	closeChan := make(chan struct{}, 1)
+	doneChan := make(chan struct{})
+	defer close(doneChan)
 
 	cli.conn.SetPongHandler(func(appData string) error {
-		pongChan <- struct{}{}
+		notifySignalChan(doneChan, pongChan)
 		return nil
 	})
 	//开始启动协程读数据
@@ -158,11 +157,13 @@ func (cli *StreamClient) processLoop() {
 			messageType, message, err := cli.conn.ReadMessage()
 			if err != nil {
 				logger.GetLogger().Errorf("connection process read message error: messageType=[%d] message=[%s] error=[%s]", messageType, string(message), err)
-				closeChan <- struct{}{}
+				notifySignalChan(doneChan, closeChan)
 				return
 			}
 			if messageType == websocket.TextMessage {
-				readChan <- message
+				if !forwardMessage(doneChan, readChan, message) {
+					return
+				}
 			}
 		}
 	}()
@@ -191,13 +192,37 @@ func (cli *StreamClient) processLoop() {
 					return
 				case <-time.After(5 * time.Second):
 					logger.GetLogger().Errorf("ping time out, connection is closing")
-					closeChan <- struct{}{}
+					notifySignalChan(doneChan, closeChan)
+					return
+				case <-doneChan:
 					return
 				}
 			}()
 		case <-closeChan:
 			return
 		}
+	}
+}
+
+// 避免连接循环退出后，后台 goroutine 再向信号 channel 发送，触发并发关闭 panic。
+func notifySignalChan(done <-chan struct{}, ch chan<- struct{}) {
+	select {
+	case <-done:
+		return
+	case ch <- struct{}{}:
+		return
+	default:
+		return
+	}
+}
+
+// 连接退出后不再转发消息，避免读协程卡在已经失效的发送路径上。
+func forwardMessage(done <-chan struct{}, ch chan<- []byte, message []byte) bool {
+	select {
+	case <-done:
+		return false
+	case ch <- message:
+		return true
 	}
 }
 
